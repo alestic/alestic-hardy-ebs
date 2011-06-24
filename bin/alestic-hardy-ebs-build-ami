@@ -1,0 +1,135 @@
+#!/bin/bash -ex
+#
+# alestic-hardy-ebs-build-ami
+#
+# Build EBS boot AMI using downloadable Ubuntu 8.04 Hardy image
+#
+# This expects to run on an EC2 instance.
+#
+
+# Ubuntu image build date
+imagedate=current
+
+# Size of AMI file system
+size=8 # GB
+
+# Ubuntu release
+codename=hardy
+ucodename=Hardy
+release=8.04
+
+# Command line options
+while [ $# -gt 0 ]; do
+  case $1 in
+    --imagedate)   imagedate=$2; shift 2 ;;
+    *)             echo "$0: Unrecognized option: $1" >&2; exit 1;
+  esac
+done
+
+if [ $(uname -m) = 'x86_64' ]; then
+  arch=x86_64
+  arch2=amd64
+  ephemeraldev=/dev/sdb
+else
+  arch=i386
+  arch2=i386
+  ephemeraldev=/dev/sda2
+fi
+
+#TBD
+name="ubuntu-$release-$codename-server-$arch2-$imagedate"
+description="Ubuntu $release $ucodename server $arch2 $imagedate"
+
+export EC2_CERT=$(echo /mnt/cert-*.pem)
+export EC2_PRIVATE_KEY=$(echo /mnt/pk-*.pem)
+
+imagename=$codename-server-uec-$arch2.img
+imageurl=http://uec-images.ubuntu.com/$codename/$imagedate/unpacked/$imagename.tar.gz
+amisurl=http://uec-images.ubuntu.com/query/$codename/server/released.$imagedate.txt
+zoneurl=http://instance-data/latest/meta-data/placement/availability-zone
+zone=$(wget -qO- $zoneurl)
+region=$(echo $zone | perl -pe 's/.$//')
+akiid=$(wget -qO- $amisurl | egrep "instance-store.$arch2.$region" | cut -f9)
+
+# Update and install Ubuntu packages
+export DEBIAN_FRONTEND=noninteractive
+sudo perl -pi -e 's/^# *(deb .*multiverse)$/$1/' /etc/apt/sources.list
+sudo apt-get update
+sudo -E apt-get upgrade -y
+sudo -E apt-get install -y \
+  ec2-api-tools            \
+  ec2-ami-tools            \
+  xfsprogs
+
+# Download base Ubuntu server image built by Canonical
+image=/mnt/$imagename
+imagedir=/mnt/$codename-uec-$arch2
+wget -O- $imageurl |
+  sudo tar xzf - -C /mnt
+sudo mkdir -p $imagedir
+sudo mount -o loop $image $imagedir
+
+export EC2_URL=http://ec2.$region.amazonaws.com
+
+# Create and mount temporary EBS volume with file system to hold new AMI image
+volumeid=$(ec2-create-volume --size $size --availability-zone $zone |
+  cut -f2)
+instanceid=$(wget -qO- http://instance-data/latest/meta-data/instance-id)
+ec2-attach-volume --device /dev/sdi --instance "$instanceid" "$volumeid"
+while [ ! -e /dev/sdi -a ! -e /dev/xvdi ]
+  do sleep 3; done
+if [ -e /dev/xvdi ]; then
+   dev=/dev/xvdi
+else
+   dev=/dev/sdi 
+fi
+sudo mkfs.ext3 -L uec-rootfs $dev
+ebsimagedir=$imagedir-ebs
+sudo mkdir $ebsimagedir
+sudo mount $dev $ebsimagedir
+
+# Copy file system from temporary rootdir to EBS volume
+sudo tar -cSf - -C $imagedir . | sudo tar xvf - -C $ebsimagedir
+sudo umount $imagedir
+sudo umount $ebsimagedir
+ec2-detach-volume "$volumeid"
+while ec2-describe-volumes "$volumeid" | grep -q ATTACHMENT
+  do sleep 3; done
+snapshotid=$(ec2-create-snapshot --description "$name" "$volumeid" | cut -f2)
+while ec2-describe-snapshots "$snapshotid" | grep -q pending
+  do sleep 30; done
+
+# Register the snapshot as a new AMI
+amiid=$(ec2-register                              \
+  --name "$name"                                  \
+  --description "$description"                    \
+  --architecture "$arch"                          \
+  --kernel "$akiid"                               \
+  --block-device-mapping $ephemeraldev=ephemeral0 \
+  --snapshot "$snapshotid" |
+  cut -f2)
+
+ec2-delete-volume "$volumeid"
+
+cat <<EOF
+AMI: $amiid $codename $region $arch2
+
+Ubuntu $release $codename
+architecture: $arch ($arch2)
+region:       $region ($zone)
+aki id:       $akiid
+name:         $name
+description:  $description
+EBS volume:   $volumeid (deleted)
+EBS snapshot: $snapshotid
+AMI:          $amiid
+
+Test the new AMI using something like:
+
+  export EC2_URL=http://ec2.$region.amazonaws.com
+  ec2-run-instances \\
+    --key \$USER \\
+    --instance-type t1.micro \\
+    $amiid
+
+EOF
