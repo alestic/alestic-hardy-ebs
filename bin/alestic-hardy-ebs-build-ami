@@ -43,13 +43,19 @@ description="Ubuntu $release $ucodename server $arch2 $imagedate"
 export EC2_CERT=$(echo /mnt/cert-*.pem)
 export EC2_PRIVATE_KEY=$(echo /mnt/pk-*.pem)
 
-imagename=$codename-server-uec-$arch2.img
+imagename=$codename-server-cloudimg-$arch2.img
 imageurl=http://uec-images.ubuntu.com/$codename/$imagedate/unpacked/$imagename.tar.gz
-amisurl=http://uec-images.ubuntu.com/query/$codename/server/released.$imagedate.txt
+amisurl=http://uec-images.ubuntu.com/query/$codename/server/released.current.txt
 zoneurl=http://instance-data/latest/meta-data/placement/availability-zone
 zone=$(wget -qO- $zoneurl)
 region=$(echo $zone | perl -pe 's/.$//')
 akiid=$(wget -qO- $amisurl | egrep "instance-store.$arch2.$region" | cut -f9)
+ariid=$(wget -qO- $amisurl | egrep "instance-store.$arch2.$region" | cut -f10)
+
+if [ -z "$akiid" -o -z "$ariid" ]; then
+   echo "$0: Can't identify AKI or ARI id from $amisurl";
+   exit 1
+fi
 
 # Update and install Ubuntu packages
 export DEBIAN_FRONTEND=noninteractive
@@ -63,7 +69,7 @@ sudo -E apt-get install -y \
 
 # Download base Ubuntu server image built by Canonical
 image=/mnt/$imagename
-imagedir=/mnt/$codename-uec-$arch2
+imagedir=/mnt/$codename-cloudimg-$arch2
 wget -O- $imageurl |
   sudo tar xzf - -C /mnt
 sudo mkdir -p $imagedir
@@ -83,7 +89,7 @@ if [ -e /dev/xvdi ]; then
 else
    dev=/dev/sdi 
 fi
-sudo mkfs.ext3 -L uec-rootfs $dev
+sudo mkfs.ext3 -L cloudimg-rootfs $dev
 ebsimagedir=$imagedir-ebs
 sudo mkdir $ebsimagedir
 sudo mount $dev $ebsimagedir
@@ -105,6 +111,7 @@ amiid=$(ec2-register                              \
   --description "$description"                    \
   --architecture "$arch"                          \
   --kernel "$akiid"                               \
+  --ramdisk "$ariid"                              \
   --block-device-mapping $ephemeraldev=ephemeral0 \
   --snapshot "$snapshotid" |
   cut -f2)
@@ -118,11 +125,12 @@ Ubuntu $release $codename
 architecture: $arch ($arch2)
 region:       $region ($zone)
 aki id:       $akiid
+ari id:       $ariid
 name:         $name
 description:  $description
 EBS volume:   $volumeid (deleted)
 EBS snapshot: $snapshotid
-AMI:          $amiid
+AMI id:       $amiid
 
 Test the new AMI using something like:
 
